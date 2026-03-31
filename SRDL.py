@@ -153,7 +153,7 @@ def parse_m3u8_url(streaming_url_list):
             return item['url']
     return None
 
-def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
+def download_ts_files(m3u8_url, out_dir, main_prefix, start_time, room_id, offline_timeout_sec=600):
     folder_display = os.path.basename(out_dir)
     print(f'開始下載: {folder_display}')
     os.makedirs(out_dir, exist_ok=True)
@@ -170,6 +170,7 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
     progress_lock = threading.Lock()
     log_lock = threading.Lock()
     log_path = os.path.join(out_dir, 'log.log')
+    live_state = {'offline_since': None, 'last_check': 0.0}
 
     def write_log(tag, text):
         now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -187,7 +188,7 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
         status = (
             f'已下載: {downloaded_count[0]} 個片段 | '
             f'補抓: {backup_count[0]} 個片段 | '
-            f'最近錯誤: {error_count[0]} 個片段'
+            f'錯誤: {error_count[0]} 個片段'
         )
         with progress_lock:
             if newline:
@@ -200,11 +201,46 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
                 last_status_len[0] = len(status)
             sys.stdout.flush()
 
+    def check_live_state():
+        now_ts = time.time()
+        if now_ts - live_state['last_check'] < 5:
+            return
+        live_state['last_check'] = now_ts
+
+        try:
+            streaming_url_list = get_streaming_url(room_id)
+        except Exception:
+            # API 暫時錯誤時不判定下播，避免誤停。
+            return
+
+        if streaming_url_list is None:
+            return
+
+        if has_hls_stream(streaming_url_list):
+            live_state['offline_since'] = None
+            return
+
+        if live_state['offline_since'] is None:
+            live_state['offline_since'] = now_ts
+            write_log('LIVE', '偵測到未開台狀態，開始 600 秒確認視窗')
+            return
+
+        offline_elapsed = int(now_ts - live_state['offline_since'])
+        if offline_elapsed >= offline_timeout_sec:
+            stop_flag['stop'] = True
+            render_status(newline=True)
+            msg = f'已連續 {offline_timeout_sec} 秒未開台，結束下載並進入合併。'
+            print(msg)
+            write_log('LIVE', msg)
+
 
     def main_thread():
         session = requests.Session()
         try:
             while not stop_flag['stop']:
+                check_live_state()
+                if stop_flag['stop']:
+                    break
                 try:
                     m3u8_obj = m3u8.load(m3u8_url)
                     for seg in m3u8_obj.segments:
@@ -243,6 +279,8 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
                                 write_log('ERROR', f'{e} | {os.path.basename(ts_url_clean)}')
                 except Exception:
                     error_count[0] += 1
+                    # 主流程發生錯誤時，仍持續抓流並持續檢查直播狀態。
+                    check_live_state()
 
                 render_status(newline=False)
                 time.sleep(2)
@@ -254,6 +292,9 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
         session = requests.Session()
         try:
             while not stop_flag['stop']:
+                check_live_state()
+                if stop_flag['stop']:
+                    break
                 try:
                     if missing_segments:
                         for ts_url_clean in list(missing_segments)[:60]:
@@ -291,7 +332,7 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
                         time.sleep(1)
                         continue
 
-                    window_end = max(-1, current_latest - 101)
+                    window_end = max(0, current_latest - 101)
                     for seq in range(current_latest - 1, window_end, -1):
                         if stop_flag['stop']:
                             break
@@ -314,6 +355,7 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
                             error_count[0] += 1
                 except Exception:
                     error_count[0] += 1
+                    check_live_state()
 
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -334,17 +376,43 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time):
 
 def merge_ts_to_mp4(out_dir, out_name):
     ts_files = [f for f in os.listdir(out_dir) if f.endswith('.ts')]
+    if not ts_files:
+        print('沒有可合併的 ts 片段，保留現有檔案並結束。')
+        return False
+
     ts_files.sort(key=lambda x: int(re.search(r'-(\d+)\.ts', x).group(1)) if re.search(r'-(\d+)\.ts', x) else 0)
     list_path = os.path.join(out_dir, 'tslist.txt')
     with open(list_path, 'w', encoding='utf-8') as f:
         for ts in ts_files:
             f.write(f"file '{ts}'\n")
     mp4_path = os.path.join(out_dir, out_name)
+    total_ts_size = 0
+    for ts in ts_files:
+        try:
+            total_ts_size += os.path.getsize(os.path.join(out_dir, ts))
+        except Exception:
+            pass
+
     cmd = [
         'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path, '-c', 'copy', mp4_path
     ]
     print('正在轉檔... (合併 ts 為 mp4...)')
-    subprocess.run(cmd)
+    result = subprocess.run(cmd)
+
+    if result.returncode != 0:
+        print(f'轉檔失敗 (ffmpeg code={result.returncode})，已保留 ts 檔案。')
+        return False
+
+    if not os.path.exists(mp4_path):
+        print('轉檔失敗：未產生 mp4，已保留 ts 檔案。')
+        return False
+
+    mp4_size = os.path.getsize(mp4_path)
+    min_expected_size = max(1024, int(total_ts_size * 0.5))
+    if mp4_size < min_expected_size:
+        print(f'轉檔失敗：mp4 大小異常 ({mp4_size} bytes)，已保留 ts 檔案。')
+        return False
+
     print(f'完成: {mp4_path}')
     for f in os.listdir(out_dir):
         if f.endswith('.ts'):
@@ -352,6 +420,7 @@ def merge_ts_to_mp4(out_dir, out_name):
                 os.remove(os.path.join(out_dir, f))
             except Exception:
                 pass
+    return True
 
 def main():
     url = input('請輸入 Showroom 直播網址: ').strip()
@@ -416,7 +485,7 @@ def main():
         if (target_dt - now).total_seconds() > 60:
             wait_until(target_dt - timedelta(minutes=1))
         else:
-            print('鄰近開台時間，已開始抓取。')
+            print('鄰近開台時間，已開始輪詢。')
 
         pre_live = poll_stream_in_last_minute(room_id, target_dt, interval_sec=5, timeout_sec=600)
         if pre_live:
@@ -463,8 +532,10 @@ def main():
     main_prefix = m.group(1) if m else m3u8_url.rsplit('.',1)[0]
 
     start_time = time.time()
-    download_ts_files(m3u8_url, out_dir, main_prefix, start_time)
-    merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
+    download_ts_files(m3u8_url, out_dir, main_prefix, start_time, room_id, offline_timeout_sec=600)
+    merge_ok = merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
+    if not merge_ok:
+        print('合併未完成，ts 已保留，請稍後重試合併。')
     return
 
 if __name__ == '__main__':
