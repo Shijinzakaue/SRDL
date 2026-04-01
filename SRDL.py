@@ -156,7 +156,7 @@ def wait_until(target_dt):
     vt_ok = False
     try:
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        handle = kernel32.GetStdHandle(-11)
         mode = ctypes.c_uint()
         if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             vt_ok = bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
@@ -259,7 +259,6 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time, room_id, offli
         try:
             streaming_url_list = get_streaming_url(room_id)
         except Exception:
-            # API 暫時錯誤時不判定下播，避免誤停。
             return
 
         if streaming_url_list is None:
