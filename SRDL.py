@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 import m3u8
 import subprocess
 from datetime import datetime, timedelta
+from datetime import timezone
 
 DOWNLOAD_DIR = 'downloads'
 
@@ -43,7 +44,7 @@ def poll_stream_in_last_minute(room_id, target_dt=None, interval_sec=5, timeout_
     vt_ok = False
     try:
         kernel32 = ctypes.windll.kernel32
-        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        handle = kernel32.GetStdHandle(-11)
         mode = ctypes.c_uint()
         if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             vt_ok = bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
@@ -99,6 +100,54 @@ def prompt_schedule():
         if re.match(r'^\d{10}$', sched):
             return sched
         print('格式錯誤，請重新輸入')
+
+def get_next_live_local_schedule(room_id):
+    api_url = f'https://www.showroom-live.com/api/room/next_live?room_id={room_id}'
+    try:
+        resp = requests.get(api_url, timeout=10)
+        if resp.status_code != 200:
+            return None, 'next_live API 讀取失敗'
+        data = resp.json()
+    except Exception:
+        return None, 'next_live API 讀取失敗'
+
+    text = str(data.get('text', '')).strip()
+    if not text or text == '未定':
+        return None, '未定'
+
+    epoch = data.get('epoch')
+    if isinstance(epoch, int) and epoch > 0:
+        try:
+            local_dt = datetime.fromtimestamp(epoch, tz=timezone.utc).astimezone()
+            return local_dt.strftime('%y%m%d%H%M'), local_dt
+        except Exception:
+            pass
+
+    m = re.match(r'^(\d{2})/(\d{2})\s+(\d{2}):(\d{2})$', text)
+    if not m:
+        return None, 'next_live 時間格式無法解析'
+
+    now_local = datetime.now().astimezone()
+    year = now_local.year
+    month = int(m.group(1))
+    day = int(m.group(2))
+    hour = int(m.group(3))
+    minute = int(m.group(4))
+
+    jst = timezone(timedelta(hours=9))
+    try:
+        jst_dt = datetime(year, month, day, hour, minute, tzinfo=jst)
+    except Exception:
+        return None, 'next_live 時間格式無法解析'
+
+    if jst_dt.astimezone(now_local.tzinfo) < now_local and month <= now_local.month:
+        try:
+            jst_dt = datetime(year + 1, month, day, hour, minute, tzinfo=jst)
+        except Exception:
+            return None, 'next_live 時間格式無法解析'
+
+    local_dt = jst_dt.astimezone(now_local.tzinfo)
+    return local_dt.strftime('%y%m%d%H%M'), local_dt
 
 def wait_until(target_dt):
     import sys
@@ -279,7 +328,6 @@ def download_ts_files(m3u8_url, out_dir, main_prefix, start_time, room_id, offli
                                 write_log('ERROR', f'{e} | {os.path.basename(ts_url_clean)}')
                 except Exception:
                     error_count[0] += 1
-                    # 主流程發生錯誤時，仍持續抓流並持續檢查直播狀態。
                     check_live_state()
 
                 render_status(newline=False)
@@ -475,7 +523,14 @@ def main():
     schedule = (sel == 1)
 
     if schedule:
-        sched_str = prompt_schedule()
+        sched_str, schedule_info = get_next_live_local_schedule(room_id)
+        if sched_str:
+            print(f'偵測到平台排程：{schedule_info.astimezone(timezone(timedelta(hours=9))).strftime("%m/%d %H:%M")}（JST）')
+            print(f'已自動換算本地時間並排程：{sched_str}')
+        else:
+            print(f'未偵測到平台排程。')
+            sched_str = prompt_schedule()
+
         try:
             target_dt = datetime.strptime(sched_str, '%y%m%d%H%M')
         except Exception:
