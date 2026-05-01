@@ -2,12 +2,14 @@ import os
 import re
 import sys
 import time
+import json
 import ctypes
 import msvcrt
 import threading
 import subprocess
 import shutil
 from datetime import datetime, timedelta, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 import m3u8
 import requests
@@ -17,6 +19,10 @@ DOWNLOAD_DIR = 'downloads'
 POLL_INTERVAL_SEC = 5
 RECOVERY_WINDOW_SEC = 600
 NO_LINK_GRACE_SEC = 20
+LOM_CONFIG_PATH = 'config.txt'
+LOM_CACHE_PATH = 'lom_cache.json'
+LOM_POLL_INTERVAL_SEC = 60
+LOM_MAX_CONCURRENT_DOWNLOADS = 3
 
 
 class Printer:
@@ -606,6 +612,36 @@ def merge_ts_to_mp4(out_dir, out_name):
     return True
 
 
+def find_and_merge_downloads_in_lom(download_dir):
+    """掃描下載目錄，找出所有有 ts 片段的資料夾並進行合併（用於 LOM 模式）"""
+    merged_count = 0
+    try:
+        if not os.path.exists(download_dir):
+            return merged_count
+        
+        for entry in os.listdir(download_dir):
+            entry_path = os.path.join(download_dir, entry)
+            if not os.path.isdir(entry_path):
+                continue
+            
+            ts_files = [f for f in os.listdir(entry_path) if f.endswith('.ts')]
+            if not ts_files:
+                continue
+            
+            folder_name = entry
+            mp4_name = f'{folder_name}.mp4'
+            print(f'[{folder_name}] 執行合併...')
+            merge_ok = merge_ts_to_mp4(entry_path, mp4_name)
+            if merge_ok:
+                merged_count += 1
+            else:
+                print(f'[{folder_name}] 合併未完成，ts 已保留。')
+    except Exception as e:
+        print(f'掃描合併異常：{e}')
+    
+    return merged_count
+
+
 def choose_menu(title, options):
     selected = 0
 
@@ -645,8 +681,357 @@ def interactive_menu():
     return choose_menu('> 選擇操作 (按 空格鍵 切換, Enter 確認)', options)
 
 
+def load_config_urls(config_path=LOM_CONFIG_PATH):
+    if not os.path.exists(config_path):
+        return []
+
+    urls = []
+    seen = set()
+    with open(config_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            raw = line.strip()
+            if not raw:
+                continue
+            if raw.startswith('#'):
+                continue
+            url = raw.split('#', 1)[0].strip()
+            if not url:
+                continue
+            if url in seen:
+                continue
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def load_lom_cache(cache_path=LOM_CACHE_PATH):
+    if not os.path.exists(cache_path):
+        return {'updated_at': None, 'url_to_room': {}, 'rooms': {}, 'failed_rooms': []}
+    try:
+        with open(cache_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            data.setdefault('updated_at', None)
+            data.setdefault('url_to_room', {})
+            data.setdefault('rooms', {})
+            data.setdefault('failed_rooms', [])
+            if isinstance(data['rooms'], dict):
+                return data
+    except Exception:
+        pass
+    return {'updated_at': None, 'url_to_room': {}, 'rooms': {}, 'failed_rooms': []}
+
+
+def save_lom_cache(cache, cache_path=LOM_CACHE_PATH):
+    cache['updated_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    tmp_path = cache_path + '.tmp'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_path, cache_path)
+
+
+def resolve_room_entries(urls, url_to_room_cache=None, printer=None):
+    if url_to_room_cache is None:
+        url_to_room_cache = {}
+    entries = []
+    failed_entries = []
+    total = len(urls)
+    need_fetch = [u for u in urls if u not in url_to_room_cache]
+    cached_count = total - len(need_fetch)
+    fetch_idx = 0
+    for url in urls:
+        if url in url_to_room_cache:
+            entries.append({'url': url, 'room_id': url_to_room_cache[url]})
+            continue
+        fetch_idx += 1
+        if printer:
+            printer.overwrite(
+                f'LOM 初始化中：解析 room_id {fetch_idx}/{len(need_fetch)}（快取命中 {cached_count} 台）'
+            )
+        try:
+            room_id = get_room_id_from_url(url)
+        except Exception:
+            room_id = None
+
+        if not room_id:
+            if printer:
+                printer.commit()
+            print(f'無法解析 room_id，略過: {url}')
+            failed_entries.append({
+                'room_id': None,
+                'url': url,
+                'error': '無法解析 room_id',
+            })
+            continue
+        url_to_room_cache[url] = room_id
+        entries.append({'url': url, 'room_id': room_id})
+    if printer:
+        if fetch_idx:
+            printer.commit(f'LOM 初始化完成：{len(entries)} 台就緒（本次新解析 {fetch_idx} 台，快取命中 {cached_count} 台）')
+        else:
+            printer.commit(f'LOM 初始化完成：全部來自快取，共 {cached_count} 台')
+    return entries, failed_entries
+
+
+def run_download_for_room(url, room_id, initial_m3u8_url=None, include_room_suffix=False):
+    m3u8_url = initial_m3u8_url
+
+    if not m3u8_url:
+        m3u8_url = get_live_m3u8_url(room_id)
+        if not m3u8_url:
+            print(f'[{room_id}] 目前未開台，執行 10 分鐘自動輪詢...')
+            m3u8_url = poll_stream_in_last_minute(
+                room_id,
+                target_dt=None,
+                interval_sec=POLL_INTERVAL_SEC,
+                timeout_sec=RECOVERY_WINDOW_SEC,
+            )
+            if not m3u8_url:
+                print(f'[{room_id}] 輪詢結束，仍未開台。')
+                return
+
+    while m3u8_url:
+        title = get_title_from_url(url)
+        nowstr = datetime.now().strftime('%y%m%d%H%M')
+        folder_name = f'{nowstr}_{sanitize_filename(title)}'
+        if include_room_suffix:
+            folder_name = f'{folder_name}_{room_id}'
+        out_dir = os.path.join(DOWNLOAD_DIR, folder_name)
+
+        stop_reason = download_ts_files(m3u8_url, out_dir, room_id)
+
+        if stop_reason != 'no_m3u8':
+            merge_ok = merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
+            if not merge_ok:
+                print(f'[{room_id}] 合併未完成，ts 已保留，請稍後自行合併。')
+            return
+
+        window_deadline = time.time() + RECOVERY_WINDOW_SEC
+        next_m3u8 = {'url': None}
+
+        def bg_poll(deadline=window_deadline, result=next_m3u8):
+            while time.time() < deadline and result['url'] is None:
+                found = get_live_m3u8_url(room_id)
+                if found:
+                    result['url'] = found
+                    return
+                time.sleep(POLL_INTERVAL_SEC)
+
+        threading.Thread(target=bg_poll, daemon=True).start()
+
+        merge_ok = merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
+        if not merge_ok:
+            print(f'[{room_id}] 合併未完成，ts 已保留，請稍後自行合併。')
+
+        if next_m3u8['url']:
+            m3u8_url = next_m3u8['url']
+            print(f'[{room_id}] 偵測到已開台，立即開始下載。')
+            continue
+
+        remaining = int(window_deadline - time.time())
+        if remaining > 0:
+            m3u8_url = poll_stream_in_last_minute(
+                room_id,
+                target_dt=None,
+                interval_sec=POLL_INTERVAL_SEC,
+                timeout_sec=remaining,
+            )
+        else:
+            m3u8_url = None
+
+        if not m3u8_url:
+            return
+
+
+def run_lom_mode():
+    status_printer = Printer()
+    status_printer.println('LOM 初始化中：讀取 config.txt 與 room_id，請稍候...')
+
+    urls = load_config_urls(LOM_CONFIG_PATH)
+    if not urls:
+        status_printer.commit()
+        print(f'找不到可用網址清單：{LOM_CONFIG_PATH}')
+        print('程序已結束。')
+        return
+
+    cache = load_lom_cache(LOM_CACHE_PATH)
+    url_to_room = cache.get('url_to_room', {})
+    rooms_cache = cache.get('rooms', {})
+
+    entries, init_failed_entries = resolve_room_entries(urls, url_to_room, status_printer)
+    if not entries:
+        status_printer.commit()
+        print('無法從清單解析任何 room_id。')
+        print('程序已結束。')
+        return
+
+    # url_to_room 保留所有曾解析成功的 URL（含已從 config.txt 移除的），避免日後重複發 HTTP 請求。
+    cache['url_to_room'] = url_to_room
+
+    # rooms 只保留目前 config.txt 有的台，欄位限縮為靜態與輪詢狀態資訊。
+    keep_ids = {entry['room_id'] for entry in entries}
+    keep_fields = {'url', 'last_checked_at', 'is_live', 'last_error'}
+    rooms_cache = {
+        rid: {k: v for k, v in value.items() if k in keep_fields}
+        for rid, value in rooms_cache.items()
+        if rid in keep_ids
+    }
+    cache['rooms'] = rooms_cache
+
+    executor = ThreadPoolExecutor(max_workers=LOM_MAX_CONCURRENT_DOWNLOADS)
+    active_downloads = {}
+
+    def get_running_download_count():
+        return sum(1 for future in active_downloads.values() if not future.done())
+
+    status_printer.println(f'LOM 模式啟動：共 {len(entries)} 台，每台每 {LOM_POLL_INTERVAL_SEC} 秒檢查一次。')
+    status_printer.println(f'同時下載上限：{LOM_MAX_CONCURRENT_DOWNLOADS} 台（Ctrl+C 可停止）')
+
+    should_merge = False  # 初始化合併標志
+    
+    try:
+        while True:
+            cycle_start = time.time()
+            now_text = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            failed_rooms = [
+                {
+                    'room_id': item.get('room_id'),
+                    'url': item.get('url'),
+                    'error': item.get('error'),
+                    'failed_at': now_text,
+                    'stage': 'resolve_room_id',
+                }
+                for item in init_failed_entries
+            ]
+
+            finished_ids = []
+            for room_id, future in active_downloads.items():
+                if future.done():
+                    finished_ids.append(room_id)
+
+            completed_in_cycle = 0
+            for room_id in finished_ids:
+                future = active_downloads.pop(room_id)
+                rooms_cache.setdefault(room_id, {})
+                try:
+                    future.result()
+                    rooms_cache[room_id]['last_error'] = None
+                    completed_in_cycle += 1
+                except Exception as e:
+                    err_text = str(e)
+                    rooms_cache[room_id]['last_error'] = err_text
+                    status_printer.commit()
+                    print(f'[{room_id}] 下載任務異常：{e}')
+                    failed_rooms.append({
+                        'room_id': room_id,
+                        'url': rooms_cache.get(room_id, {}).get('url'),
+                        'error': err_text,
+                        'failed_at': now_text,
+                        'stage': 'download_task',
+                    })
+
+            total_entries = len(entries)
+            for idx, entry in enumerate(entries, start=1):
+                room_id = entry['room_id']
+                url = entry['url']
+
+                status_printer.overwrite(
+                    f'LOM 輪詢中：{idx}/{total_entries} | 下載中 {get_running_download_count()} 台 | 已下載 {completed_in_cycle} 台'
+                )
+
+                room_state = rooms_cache.setdefault(room_id, {})
+                room_state['url'] = url
+                room_state['last_checked_at'] = now_text
+
+                if room_id in active_downloads:
+                    room_state['is_live'] = True
+                    continue
+
+                try:
+                    m3u8_url = get_live_m3u8_url(room_id)
+                    is_live = bool(m3u8_url)
+                    room_state['is_live'] = is_live
+                    room_state['last_error'] = None
+                except Exception as e:
+                    err_text = str(e)
+                    room_state['is_live'] = False
+                    room_state['last_error'] = err_text
+                    failed_rooms.append({
+                        'room_id': room_id,
+                        'url': url,
+                        'error': err_text,
+                        'failed_at': now_text,
+                        'stage': 'fetch_live_state',
+                    })
+                    continue
+
+                if not m3u8_url:
+                    continue
+
+                status_printer.commit()
+                print(f'[{room_id}] 偵測到開台，啟動下載任務。')
+                future = executor.submit(run_download_for_room, url, room_id, m3u8_url, True)
+                active_downloads[room_id] = future
+
+            cache['failed_rooms'] = failed_rooms
+            save_lom_cache(cache, LOM_CACHE_PATH)
+
+            elapsed = time.time() - cycle_start
+            sleep_sec = max(1, int(LOM_POLL_INTERVAL_SEC - elapsed))
+            for remain in range(sleep_sec, 0, -1):
+                status_printer.overwrite(
+                    f'LOM 輪詢完成：下載中 {get_running_download_count()} 台 | 已下載 {completed_in_cycle} 台 | {remain} 秒後下一輪'
+                )
+                time.sleep(1)
+
+    except KeyboardInterrupt:
+        status_printer.commit()
+        print('收到停止指令，LOM 輪詢已結束。')
+        
+        should_merge = True
+        if active_downloads:
+            print(f'目前有 {len(active_downloads)} 個下載進程在進行中。')
+            try:
+                response = input('是否要等待這些下載完成並進行合併？(y/n): ').strip().lower()
+                if response == 'n':
+                    should_merge = False
+                    print('將保留已下載片段，不執行合併。')
+                else:
+                    print('等待下載完成...')
+            except KeyboardInterrupt:
+                status_printer.commit()
+                print('\n收到第二次停止指令，將進行合併。')
+                should_merge = True
+        else:
+            should_merge = False
+    
+    finally:
+        status_printer.commit()
+        save_lom_cache(cache, LOM_CACHE_PATH)
+        
+        if should_merge:
+            print('等待所有下載線程安全終止...')
+            executor.shutdown(wait=True)
+            print('所有下載已完成，執行合併...')
+            merged_count = find_and_merge_downloads_in_lom(DOWNLOAD_DIR)
+            if merged_count > 0:
+                print(f'成功合併 {merged_count} 部直播。')
+            else:
+                print('未找到需合併的下載。')
+        else:
+            print('強制停止下載線程...')
+            executor.shutdown(wait=False)
+        
+        print('LOM 模式已停止。')
+
+
 def main():
     url = input('請輸入 Showroom 直播網址: ').strip()
+
+    if url.lower() == 'lom':
+        run_lom_mode()
+        return
+
     room_id = get_room_id_from_url(url)
     if not room_id:
         print('無法擷取 room_id')
@@ -692,54 +1077,7 @@ def main():
         print('程序已結束。')
         return
 
-    while m3u8_url:
-        title = get_title_from_url(url)
-        nowstr = datetime.now().strftime('%y%m%d%H%M')
-        folder_name = f'{nowstr}_{sanitize_filename(title)}'
-        out_dir = os.path.join(DOWNLOAD_DIR, folder_name)
-
-        stop_reason = download_ts_files(m3u8_url, out_dir, room_id)
-
-        if stop_reason != 'no_m3u8':
-            merge_ok = merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
-            if not merge_ok:
-                print('合併未完成，ts 已保留，請稍後自行合併。')
-            print('程序已結束。')
-            return
-
-        window_deadline = time.time() + RECOVERY_WINDOW_SEC
-        next_m3u8 = {'url': None}
-
-        def bg_poll(deadline=window_deadline, result=next_m3u8):
-            while time.time() < deadline and result['url'] is None:
-                found = get_live_m3u8_url(room_id)
-                if found:
-                    result['url'] = found
-                    return
-                time.sleep(POLL_INTERVAL_SEC)
-
-        threading.Thread(target=bg_poll, daemon=True).start()
-
-        merge_ok = merge_ts_to_mp4(out_dir, f'{folder_name}.mp4')
-        if not merge_ok:
-            print('合併未完成，ts 已保留，請稍後自行合併。')
-
-        if next_m3u8['url']:
-            m3u8_url = next_m3u8['url']
-            print('偵測到已開台，立即開始下載。')
-            continue
-
-        remaining = int(window_deadline - time.time())
-        if remaining > 0:
-            m3u8_url = poll_stream_in_last_minute(room_id, target_dt=None, interval_sec=POLL_INTERVAL_SEC, timeout_sec=remaining)
-        else:
-            m3u8_url = None
-
-        if not m3u8_url:
-            print('程序已結束。')
-            return
-
-    print('找不到 m3u8 連結。')
+    run_download_for_room(url, room_id, m3u8_url, include_room_suffix=False)
     print('程序已結束。')
 
 
